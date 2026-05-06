@@ -14,25 +14,23 @@ curl -fsSL https://github.com/lunal-dev/confidential-cvm-cli/releases/latest/dow
 
 This installs two binaries to `/usr/local/bin/`:
 
-- `cc` - the CLI shell script (this repo)
+- `ccvm` - the CLI shell script (this repo)
 - `attestation-cli` - pre-built binary from [lunal-dev/attestation-rs](https://github.com/lunal-dev/attestation-rs) that performs the cryptographic SEV-SNP and TPM attestation
 
 ## Commands
 
 ```bash
-cc vm <command> [flags]
+ccvm <command> [flags]
 ```
 
 | Command | Description |
 |---|---|
-| `cc vm verify [-v\|--verbose]` | Run the full 5-check TEE verification |
-| `cc vm info` | Print component versions, hostname, gateway IP, install date |
-| `cc vm attest` | Generate attestation evidence (boot-time; run by cloud-init) |
-| `cc vm assign` | Apply user configuration from IMDS (internal; run by systemd) |
+| `ccvm verify [-v\|--verbose]` | Run the full 5-check TEE verification |
+| `ccvm info` | Print component versions, hostname, gateway IP, install date |
+| `ccvm attest` | Generate attestation evidence (boot-time; run by cloud-init) |
+| `ccvm assign` | Apply user configuration from IMDS (internal; run by systemd) |
 
-The legacy single-level command shape is still accepted when cheap, so `cc verify` currently maps to `cc vm verify`.
-
-### `cc vm verify`
+### `ccvm verify`
 
 User-facing command. Runs five checks and prints a pass/fail summary:
 
@@ -44,12 +42,12 @@ User-facing command. Runs five checks and prints a pass/fail summary:
 
 Add `-v` / `--verbose` for full cert-chain, VCEK, and endpoint diagnostics.
 
-### `cc vm info`
+### `ccvm info`
 
 Prints a compact status block useful for bug reports and quick sanity checks:
 
 ```text
-cc:                v1.5.8
+ccvm:              v1.5.8
 attestation-cli:   v0.4.1
 openclaw:          <version>
 Hostname:          <fqdn>
@@ -57,11 +55,11 @@ Gateway IP:        <gateway>
 Installed:         <date>
 ```
 
-### `cc vm attest`
+### `ccvm attest`
 
 Boot-time command invoked by cloud-init. Generates SEV-SNP + TPM attestation evidence binding the SSH host key to the TEE hardware and writes it to `/etc/privateclaw/evidence.json` for current compatibility.
 
-### `cc vm assign`
+### `ccvm assign`
 
 Internal command invoked by a systemd timer. Polls Azure IMDS for user configuration and applies it to the CVM.
 
@@ -85,11 +83,11 @@ Confidential Agents cloud-init has not been changed yet. Once this repo has a pu
 https://github.com/lunal-dev/confidential-cvm-cli/releases/latest/download/install.sh
 ```
 
-Then update boot/runtime invocations from `privateclaw attest`, `privateclaw assign`, and `privateclaw verify` to `cc vm attest`, `cc vm assign`, and `cc vm verify`.
+Then update boot/runtime invocations from `privateclaw attest`, `privateclaw assign`, and `privateclaw verify` to `ccvm attest`, `ccvm assign`, and `ccvm verify`.
 
 ## Auditing
 
-Everything that runs on your CVM lives in this repo. `cc` is a single bash script. The only binary dependency is [`attestation-cli`](https://github.com/lunal-dev/attestation-rs), which is also open source.
+Everything that runs on your CVM lives in this repo. `ccvm` is a single bash script. The only binary dependency is [`attestation-cli`](https://github.com/lunal-dev/attestation-rs), which is also open source.
 
 ## License
 

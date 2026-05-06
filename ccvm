@@ -31,7 +31,7 @@ fi
 HCL_REPORT_NV="0x01400001"
 
 # ---------------------------------------------------------------------------
-# cc vm attest
+# ccvm attest
 #   Called at boot by cloud-init. Generates attestation evidence binding the
 #   SSH host key to the TEE.
 #
@@ -98,7 +98,7 @@ EOFEVIDENCE
 }
 
 # ---------------------------------------------------------------------------
-# cc vm verify
+# ccvm verify
 #   User-facing command. Verifies TEE attestation, inference provider, and
 #   SSH access lockout. Handles everything automatically — no manual steps.
 #
@@ -759,7 +759,7 @@ PYEOF
 }
 
 # ---------------------------------------------------------------------------
-# cc vm assign
+# ccvm assign
 #   Called by systemd timer. Polls IMDS userData and applies user-specific
 #   configuration (SSH key, OpenClaw, MOTD, Caddy TLS).
 # ---------------------------------------------------------------------------
@@ -881,7 +881,7 @@ OCEOF
       |  with end-to-end private inference                       |
       |                                                          |
       |  Verify your TEE:                                        |
-      |    $ cc vm verify                                        |
+      |    $ ccvm verify                                         |
       |                                                          |
       |  Connect a messaging provider:                           |
       |    $ openclaw configure --section channels               |
@@ -921,7 +921,7 @@ MOTDEOF
 }
 
 # ---------------------------------------------------------------------------
-# cc vm info
+# ccvm info
 #   Print environment info for user debugging: component versions, hostname,
 #   gateway IP, and install date.
 # ---------------------------------------------------------------------------
@@ -966,13 +966,13 @@ cmd_info() {
 
   # Install date
   local installed="not found"
-  if [ -f /usr/local/bin/cc ]; then
-    installed=$(stat -c %y /usr/local/bin/cc 2>/dev/null | cut -d' ' -f1)
+  if [ -f /usr/local/bin/ccvm ]; then
+    installed=$(stat -c %y /usr/local/bin/ccvm 2>/dev/null | cut -d' ' -f1)
     [ -z "$installed" ] && installed="not found"
   fi
 
   # Aligned output (labels padded to 18 chars)
-  printf '%-18s %s\n' "cc:"              "$VERSION"
+  printf '%-18s %s\n' "ccvm:"            "$VERSION"
   printf '%-18s %s\n' "attestation-cli:" "$att_version"
   printf '%-18s %s\n' "openclaw:"        "$openclaw_version"
   printf '%-18s %s\n' "Hostname:"        "$host"
@@ -984,17 +984,22 @@ cmd_info() {
 # Main dispatch
 # ---------------------------------------------------------------------------
 print_usage() {
-  echo "Usage: cc vm <command> [flags]"
+  echo "Usage: ccvm <command> [flags]"
   echo ""
   echo "Commands:"
-  echo "  vm verify [-v|--verbose]   Verify SEV-SNP hardware, TPM, host key, inference, and access lockout"
-  echo "                             -v/--verbose shows full cert chain and diagnostic details"
-  echo "  vm attest                  Generate attestation evidence (run at boot)"
-  echo "  vm assign                  Apply user configuration from IMDS (run by systemd)"
-  echo "  vm info                    Print component versions, hostname, gateway IP, and install date"
+  echo "  verify [-v|--verbose]   Verify SEV-SNP hardware, TPM, host key, inference, and access lockout"
+  echo "                          -v/--verbose shows full cert chain and diagnostic details"
+  echo "  attest                  Generate attestation evidence (run at boot)"
+  echo "  assign                  Apply user configuration from IMDS (run by systemd)"
+  echo "  info                    Print component versions, hostname, gateway IP, and install date"
 }
 
 case "${1:-}" in
+  attest)  shift; cmd_attest "$@" ;;
+  verify)  shift; cmd_verify "$@" ;;
+  assign)  shift; cmd_assign "$@" ;;
+  info)    shift; cmd_info "$@" ;;
+  # Cheap compatibility for the prior two-level command shape.
   vm)
     shift
     case "${1:-}" in
@@ -1005,11 +1010,6 @@ case "${1:-}" in
       *)       print_usage ;;
     esac
     ;;
-  # Cheap compatibility for the original single-level command shape.
-  attest)  shift; cmd_attest "$@" ;;
-  verify)  shift; cmd_verify "$@" ;;
-  assign)  shift; cmd_assign "$@" ;;
-  info)    shift; cmd_info "$@" ;;
   *)
     print_usage
     ;;
