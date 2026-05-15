@@ -5,7 +5,7 @@ set -e
 # TEE verification and management for confidential compute VMs.
 # https://github.com/lunal-dev/confidential-cvm-cli
 
-VERSION="v1.5.8"
+VERSION="v1.5.9"
 
 ATTEST_DIR="/etc/privateclaw"
 EVIDENCE_FILE="$ATTEST_DIR/evidence.json"
@@ -383,12 +383,12 @@ cmd_verify() {
     FAIL_COUNT=$((FAIL_COUNT + 1))
     echo ""
   else
-    # Try "confidential" provider first, fall back to legacy "lunal" for older configs
-    ENDPOINT=$(jq -r '.models.providers.confidential.baseUrl // .models.providers.lunal.baseUrl // "not configured"' "$OC_CONFIG" 2>/dev/null || echo "not configured")
+    # Try "confai" provider first (new name), fall back to "confidential" (legacy), then "lunal" (oldest)
+    ENDPOINT=$(jq -r '.models.providers.confai.baseUrl // .models.providers.confidential.baseUrl // .models.providers.lunal.baseUrl // "not configured"' "$OC_CONFIG" 2>/dev/null || echo "not configured")
     [ "$VERBOSE" = "true" ] && echo "  Endpoint:      $ENDPOINT"
 
     # Read bearer token from openclaw config (apiKey field)
-    BEARER_TOKEN=$(jq -r '.models.providers.confidential.apiKey // .models.providers.lunal.apiKey // empty' "$OC_CONFIG" 2>/dev/null || true)
+    BEARER_TOKEN=$(jq -r '.models.providers.confai.apiKey // .models.providers.confidential.apiKey // .models.providers.lunal.apiKey // empty' "$OC_CONFIG" 2>/dev/null || true)
 
     # Make a minimal request to the inference endpoint and capture response headers
     INF_HEADERS=""
@@ -957,7 +957,7 @@ cmd_info() {
   local gateway_ip="not found"
   local openclaw_conf="$HOME/.openclaw/openclaw.json"
   if [ -f "$openclaw_conf" ] && command -v jq &>/dev/null; then
-    gateway_ip=$(jq -r '.models.providers.confidential.baseUrl // empty' "$openclaw_conf" 2>/dev/null \
+    gateway_ip=$(jq -r '.models.providers.confai.baseUrl // .models.providers.confidential.baseUrl // empty' "$openclaw_conf" 2>/dev/null \
       | sed 's|https://||; s|http://||' \
       | cut -d: -f1 \
       | cut -d/ -f1)
