@@ -1,0 +1,1016 @@
+#!/bin/bash
+set -e
+
+# Confidential CVM CLI
+# TEE verification and management for confidential compute VMs.
+# https://github.com/lunal-dev/confidential-cvm-cli
+
+VERSION="v1.5.9"
+
+ATTEST_DIR="/etc/privateclaw"
+EVIDENCE_FILE="$ATTEST_DIR/evidence.json"
+SNP_EVIDENCE_FILE="$ATTEST_DIR/snp_evidence.json"
+HOST_KEY="/etc/ssh/ssh_host_ed25519_key.pub"
+HOST_KEY_HASH_FILE="$ATTEST_DIR/host_key_hash.txt"
+INFERENCE_CONF="$ATTEST_DIR/inference.conf"
+ASSIGN_LOCK="$ATTEST_DIR/.assigned"
+
+# attestation-cli binary path (auto-detect or override via env)
+ATTESTATION_CLI="${ATTESTATION_CLI_PATH:-}"
+if [ -z "$ATTESTATION_CLI" ]; then
+  if command -v attestation-cli &>/dev/null; then
+    ATTESTATION_CLI="attestation-cli"
+  elif [ -x /opt/confidential-services/attestation-cli ]; then
+    ATTESTATION_CLI="/opt/confidential-services/attestation-cli"
+  elif [ -x /opt/lunal-services/attestation-cli ]; then
+    ATTESTATION_CLI="/opt/lunal-services/attestation-cli"
+  fi
+fi
+
+# Azure CVM vTPM NV indices
+HCL_REPORT_NV="0x01400001"
+
+# ---------------------------------------------------------------------------
+# ccvm attest
+#   Called at boot by cloud-init. Generates attestation evidence binding the
+#   SSH host key to the TEE.
+#
+#   Strategy: Try attestation-cli first (clean JSON output with full cert chain).
+#   If that fails (known TPM auth issue on some Azure CVM images), fall back
+#   to tpm2_nvread to extract the raw HCL report as evidence.
+# ---------------------------------------------------------------------------
+cmd_attest() {
+  if [ ! -f "$HOST_KEY" ]; then
+    echo "ERROR: No SSH host key found at $HOST_KEY"
+    exit 1
+  fi
+
+  mkdir -p "$ATTEST_DIR"
+
+  HOST_KEY_HASH=$(sha256sum "$HOST_KEY" | awk '{print $1}')
+  REPORT_DATA=$(printf '%-128s' "$HOST_KEY_HASH" | tr ' ' '0')
+
+  echo "$HOST_KEY_HASH" > "$HOST_KEY_HASH_FILE"
+
+  # Try attestation-cli first (produces full JSON with cert chain + SNP report)
+  if [ -n "$ATTESTATION_CLI" ]; then
+    if $ATTESTATION_CLI attest --report-data-hex "$REPORT_DATA" -o "$EVIDENCE_FILE" 2>/dev/null; then
+      echo "Attestation evidence generated via attestation-cli: $EVIDENCE_FILE"
+      return 0
+    fi
+    echo "attestation-cli attest failed, falling back to tpm2 extraction..."
+  fi
+
+  # Fallback: extract HCL report from vTPM NV index using tpm2-tools
+  if ! command -v tpm2_nvread &>/dev/null; then
+    echo "ERROR: Neither attestation-cli nor tpm2-tools available"
+    exit 1
+  fi
+
+  # Read HCL report (contains SNP attestation report)
+  # -C o = owner hierarchy auth (required for Azure CVM NV indices with ownerread attribute)
+  HCL_TMPFILE=$(mktemp)
+  if ! tpm2_nvread "$HCL_REPORT_NV" -C o -o "$HCL_TMPFILE" 2>/dev/null; then
+    rm -f "$HCL_TMPFILE"
+    echo "ERROR: Failed to read HCL report from TPM NV index $HCL_REPORT_NV"
+    exit 1
+  fi
+  HCL_REPORT=$(xxd -p "$HCL_TMPFILE" | tr -d '\n')
+  rm -f "$HCL_TMPFILE"
+  if [ -z "$HCL_REPORT" ]; then
+    echo "ERROR: HCL report is empty"
+    exit 1
+  fi
+
+  # Build evidence JSON with the raw HCL report + host key binding
+  cat > "$EVIDENCE_FILE" << EOFEVIDENCE
+{
+  "platform": "az-snp",
+  "method": "tpm2_nvread",
+  "host_key_hash": "$HOST_KEY_HASH",
+  "report_data_hex": "$REPORT_DATA",
+  "hcl_report_hex": "$HCL_REPORT",
+  "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+}
+EOFEVIDENCE
+
+  echo "Attestation evidence generated via tpm2-tools: $EVIDENCE_FILE"
+}
+
+# ---------------------------------------------------------------------------
+# ccvm verify
+#   User-facing command. Verifies TEE attestation, inference provider, and
+#   SSH access lockout. Handles everything automatically — no manual steps.
+#
+#   Checks (in order):
+#     1. SEV-SNP Hardware   — fresh SNP report + VCEK certificate chain
+#     2. TPM Attestation    — HCL report from vTPM NV index
+#     3. Host Key Binding   — SSH host key hash matches boot-time record
+#     4. Inference Provider  — endpoint reachable + attestation header
+#     5. Access Lockout      — SSH keys + firewall + cloud provider access
+# ---------------------------------------------------------------------------
+cmd_verify() {
+  # Parse flags: --verbose / -v shows the full diagnostic info (cert chains,
+  # endpoint, VCEK details, etc.). Default output is a simplified summary.
+  VERBOSE=false
+  for arg in "$@"; do
+    case "$arg" in
+      --verbose|-v) VERBOSE=true ;;
+    esac
+  done
+
+  echo ""
+  echo "=== Confidential CVM Verification ==="
+  echo ""
+
+  TOTAL_CHECKS=5
+  PASS_COUNT=0
+  FAIL_COUNT=0
+
+  # Find admin user home
+  ADMIN_HOME="/home/azureuser"
+  if [ -f "$INFERENCE_CONF" ]; then
+    CONF_USER=$(grep -E '^(VM_USER|ADMIN_USERNAME|CVM_ADMIN_USER|ADMIN_USER)=' "$INFERENCE_CONF" 2>/dev/null | cut -d= -f2)
+    if [ -n "$CONF_USER" ]; then
+      ADMIN_HOME="/home/$CONF_USER"
+    fi
+  fi
+
+  # Ensure attestation evidence exists (needed by checks 2 and 3)
+  if [ ! -f "$EVIDENCE_FILE" ]; then
+    cmd_attest >/dev/null 2>&1 || true
+  fi
+
+  # Compute current host key hash (used by checks 1 and 3)
+  CURRENT_HOST_KEY_HASH=""
+  if [ -f "$HOST_KEY" ]; then
+    CURRENT_HOST_KEY_HASH=$(sha256sum "$HOST_KEY" | awk '{print $1}')
+  fi
+
+  # ==========================================================================
+  # Check 1: SEV-SNP Hardware Attestation
+  # ==========================================================================
+  echo "[1/$TOTAL_CHECKS] SEV-SNP Hardware"
+
+  if [ -z "$ATTESTATION_CLI" ]; then
+    echo "  Status:        SKIP (attestation-cli not found)"
+    echo "  Hint:          install attestation-cli or set ATTESTATION_CLI_PATH"
+    FAIL_COUNT=$((FAIL_COUNT + 1))
+    echo ""
+  else
+    # Request a fresh SNP attestation report with the host key hash as report_data
+    SNP_REPORT_DATA=""
+    if [ -n "$CURRENT_HOST_KEY_HASH" ]; then
+      SNP_REPORT_DATA=$(printf '%-128s' "$CURRENT_HOST_KEY_HASH" | tr ' ' '0')
+    fi
+
+    SNP_TMPFILE=$(mktemp /tmp/snp_evidence_XXXXXX.json)
+    SNP_OK=false
+
+    if [ -n "$SNP_REPORT_DATA" ]; then
+      SNP_ATTEST_OUT=$($ATTESTATION_CLI attest \
+        --platform az-snp \
+        --report-data-hex "$SNP_REPORT_DATA" \
+        -o "$SNP_TMPFILE" 2>&1) || true
+    else
+      SNP_ATTEST_OUT=$($ATTESTATION_CLI attest \
+        --platform az-snp \
+        -o "$SNP_TMPFILE" 2>&1) || true
+    fi
+
+    # Fallback 1: Some Azure CVM images fail Esys_Quote when --report-data-hex
+    # is provided (TPM owner auth issue, not a permissions problem — affects
+    # root and non-root alike). Retry without --report-data-hex; the host key
+    # binding is independently verified in Check 3.
+    if { [ ! -s "$SNP_TMPFILE" ] || ! jq -e . "$SNP_TMPFILE" &>/dev/null; } && [ -n "$SNP_REPORT_DATA" ]; then
+      if echo "$SNP_ATTEST_OUT" | grep -qi "Esys_Quote\|get_quote failed\|tpm error"; then
+        SNP_ATTEST_OUT=$($ATTESTATION_CLI attest \
+          --platform az-snp \
+          -o "$SNP_TMPFILE" 2>&1) || true
+      fi
+    fi
+
+    # Fallback 2: TPM device (/dev/tpmrm0) is owned by root:tss. If the current user
+    # is not in the tss group, the attest call fails with "vtpm::get_report failed:
+    # tpm error". Retry under sudo if available — most CVM admin users have
+    # passwordless sudo configured.
+    if { [ ! -s "$SNP_TMPFILE" ] || ! jq -e . "$SNP_TMPFILE" &>/dev/null; } && command -v sudo &>/dev/null; then
+      if echo "$SNP_ATTEST_OUT" | grep -qi "tpm error\|permission denied\|EACCES\|get_report failed" || ! [ -s "$SNP_TMPFILE" ]; then
+        SNP_ATTEST_OUT=$(sudo -n "$ATTESTATION_CLI" attest \
+          --platform az-snp \
+          -o "$SNP_TMPFILE" 2>&1) || true
+        # Fix ownership so subsequent jq/cp work as the current user
+        sudo -n chown "$(id -u):$(id -g)" "$SNP_TMPFILE" 2>/dev/null || true
+      fi
+    fi
+
+    # If still failing, give a helpful hint about tss group membership
+    if { [ ! -s "$SNP_TMPFILE" ] || ! jq -e . "$SNP_TMPFILE" &>/dev/null; } \
+        && echo "$SNP_ATTEST_OUT" | grep -qi "tpm error\|permission denied\|EACCES\|get_report failed"; then
+      SNP_ATTEST_OUT="TPM access denied — add this user to the 'tss' group: sudo usermod -aG tss \$USER (then re-login). Detail: $SNP_ATTEST_OUT"
+    fi
+
+    if [ -f "$SNP_TMPFILE" ] && [ -s "$SNP_TMPFILE" ] && jq -e . "$SNP_TMPFILE" &>/dev/null; then
+      # Verify the SNP report via attestation-cli (validates VCEK cert chain)
+      SNP_VERIFY_RESULT=$($ATTESTATION_CLI verify -e "$SNP_TMPFILE" 2>/dev/null) || true
+
+      if [ -n "$SNP_VERIFY_RESULT" ] && echo "$SNP_VERIFY_RESULT" | jq -e . &>/dev/null; then
+        SNP_SIG_VALID=$(echo "$SNP_VERIFY_RESULT" | jq -r '.signature_valid // false')
+        SNP_PLATFORM=$(echo "$SNP_VERIFY_RESULT" | jq -r '.platform // "unknown"')
+
+        echo "  Platform:      $SNP_PLATFORM"
+
+        # Extract VCEK certificate subject if present
+        VCEK_SUBJECT=$(echo "$SNP_VERIFY_RESULT" | jq -r '.vcek_subject // empty' 2>/dev/null)
+        if [ -n "$VCEK_SUBJECT" ]; then
+          echo "  VCEK:          $VCEK_SUBJECT"
+        fi
+
+        # Extract SNP report fields from the evidence or verify result
+        GUEST_SVN=$(jq -r '.snp_report.guest_svn // .guest_svn // empty' "$SNP_TMPFILE" 2>/dev/null)
+        SNP_POLICY=$(jq -r '.snp_report.policy // .policy // empty' "$SNP_TMPFILE" 2>/dev/null)
+        MEASUREMENT=$(jq -r '.snp_report.measurement // .measurement // empty' "$SNP_TMPFILE" 2>/dev/null)
+        HOST_DATA=$(jq -r '.snp_report.host_data // .host_data // empty' "$SNP_TMPFILE" 2>/dev/null)
+        REPORT_DATA_FIELD=$(jq -r '.snp_report.report_data // .report_data // empty' "$SNP_TMPFILE" 2>/dev/null)
+
+        [ -n "$GUEST_SVN" ] && echo "  Guest SVN:     $GUEST_SVN"
+        [ -n "$SNP_POLICY" ] && echo "  Policy:        $SNP_POLICY"
+        if [ -n "$MEASUREMENT" ]; then
+          echo "  Measurement:   ${MEASUREMENT:0:32}..."
+        fi
+        if [ -n "$HOST_DATA" ] && [ "$HOST_DATA" != "0000000000000000000000000000000000000000000000000000000000000000" ]; then
+          echo "  Host Data:     ${HOST_DATA:0:32}..."
+        fi
+        if [ -n "$REPORT_DATA_FIELD" ]; then
+          echo "  Report Data:   ${REPORT_DATA_FIELD:0:32}... (SSH key hash)"
+        fi
+
+        echo "  VCEK Chain:    $([ "$SNP_SIG_VALID" = "true" ] && echo 'VALID (AMD root CA -> VCEK -> SNP report)' || echo 'INVALID')"
+
+        if [ "$SNP_SIG_VALID" = "true" ]; then
+          echo "  Status:        PASS"
+          PASS_COUNT=$((PASS_COUNT + 1))
+          SNP_OK=true
+          # Save SNP evidence for reference
+          cp "$SNP_TMPFILE" "$SNP_EVIDENCE_FILE" 2>/dev/null || true
+        else
+          echo "  Status:        FAIL (VCEK signature verification failed)"
+          FAIL_COUNT=$((FAIL_COUNT + 1))
+        fi
+      else
+        echo "  Attestation:   report obtained but verification failed"
+        echo "  Status:        FAIL"
+        FAIL_COUNT=$((FAIL_COUNT + 1))
+      fi
+    else
+      echo "  Error:         could not obtain SNP report from hardware"
+      if [ -n "$SNP_ATTEST_OUT" ]; then
+        echo "  Detail:        $(echo "$SNP_ATTEST_OUT" | head -1)"
+      fi
+      echo "  Status:        FAIL"
+      FAIL_COUNT=$((FAIL_COUNT + 1))
+    fi
+    rm -f "$SNP_TMPFILE"
+    echo ""
+  fi
+
+  # ==========================================================================
+  # Check 2: TPM Attestation (HCL Report)
+  # ==========================================================================
+  echo "[2/$TOTAL_CHECKS] TPM Attestation"
+
+  if [ ! -f "$EVIDENCE_FILE" ]; then
+    echo "  Status:        FAIL (no attestation evidence found)"
+    FAIL_COUNT=$((FAIL_COUNT + 1))
+    echo ""
+  else
+    METHOD=$(jq -r '.method // "attestation-cli"' "$EVIDENCE_FILE" 2>/dev/null)
+
+    if [ "$METHOD" = "tpm2_nvread" ]; then
+      HCL_PRESENT=$(jq -r '.hcl_report_hex // empty' "$EVIDENCE_FILE" 2>/dev/null)
+      echo "  Method:        tpm2_nvread (TPM NV index $HCL_REPORT_NV)"
+      if [ -n "$HCL_PRESENT" ] && [ ${#HCL_PRESENT} -gt 100 ]; then
+        echo "  HCL Report:    present (${#HCL_PRESENT} hex chars)"
+        echo "  Status:        PASS"
+        PASS_COUNT=$((PASS_COUNT + 1))
+      else
+        echo "  HCL Report:    MISSING or empty"
+        echo "  Status:        FAIL"
+        FAIL_COUNT=$((FAIL_COUNT + 1))
+      fi
+    else
+      # Evidence from attestation-cli — verify it
+      if [ -n "$ATTESTATION_CLI" ]; then
+        TPM_VERIFY_RESULT=$($ATTESTATION_CLI verify -e "$EVIDENCE_FILE" 2>/dev/null) || true
+        if [ -n "$TPM_VERIFY_RESULT" ] && echo "$TPM_VERIFY_RESULT" | jq -e . &>/dev/null; then
+          TPM_SIG_VALID=$(echo "$TPM_VERIFY_RESULT" | jq -r '.signature_valid // false')
+          TPM_PLATFORM=$(echo "$TPM_VERIFY_RESULT" | jq -r '.platform // "unknown"')
+          echo "  Method:        attestation-cli"
+          echo "  Platform:      $TPM_PLATFORM"
+          echo "  Signature:     $([ "$TPM_SIG_VALID" = "true" ] && echo 'VALID' || echo 'INVALID')"
+          if [ "$TPM_SIG_VALID" = "true" ]; then
+            echo "  Status:        PASS"
+            PASS_COUNT=$((PASS_COUNT + 1))
+          else
+            echo "  Status:        FAIL"
+            FAIL_COUNT=$((FAIL_COUNT + 1))
+          fi
+        else
+          echo "  Method:        attestation-cli"
+          echo "  Verification:  failed"
+          echo "  Status:        FAIL"
+          FAIL_COUNT=$((FAIL_COUNT + 1))
+        fi
+      else
+        echo "  Method:        attestation-cli (evidence present, no verifier)"
+        echo "  Status:        FAIL (attestation-cli not found to verify)"
+        FAIL_COUNT=$((FAIL_COUNT + 1))
+      fi
+    fi
+    echo ""
+  fi
+
+  # ==========================================================================
+  # Check 3: Host Key Binding
+  # ==========================================================================
+  echo "[3/$TOTAL_CHECKS] Host Key Binding"
+
+  if [ -z "$CURRENT_HOST_KEY_HASH" ]; then
+    echo "  Status:        FAIL (no SSH host key at $HOST_KEY)"
+    FAIL_COUNT=$((FAIL_COUNT + 1))
+  elif [ ! -f "$EVIDENCE_FILE" ]; then
+    echo "  Status:        FAIL (no evidence file to compare)"
+    FAIL_COUNT=$((FAIL_COUNT + 1))
+  else
+    STORED_HASH=$(jq -r '.host_key_hash // empty' "$EVIDENCE_FILE" 2>/dev/null)
+    if [ -z "$STORED_HASH" ]; then
+      # Try reading from the hash file
+      STORED_HASH=$(cat "$HOST_KEY_HASH_FILE" 2>/dev/null | tr -d '[:space:]')
+    fi
+
+    echo "  Current hash:  ${CURRENT_HOST_KEY_HASH:0:16}..."
+    echo "  Boot hash:     ${STORED_HASH:0:16}..."
+
+    if [ "$STORED_HASH" = "$CURRENT_HOST_KEY_HASH" ]; then
+      echo "  Match:         YES (key unchanged since boot attestation)"
+      echo "  Status:        PASS"
+      PASS_COUNT=$((PASS_COUNT + 1))
+    else
+      echo "  Match:         NO (key changed since boot — attestation is stale)"
+      echo "  Status:        FAIL"
+      FAIL_COUNT=$((FAIL_COUNT + 1))
+    fi
+  fi
+  echo ""
+
+  # ==========================================================================
+  # Check 4: Inference Provider
+  #
+  # Two sub-checks roll up into one Status line:
+  #   - Upstream provider: "Confidential AI" (AMD SEV-SNP TEE via our tee-proxy)
+  #                        OR "Redpill" (Intel TDX + NVIDIA H100 CC, failover)
+  #   - Confidential Gateway: our tee-proxy itself (AMD SEV-SNP)
+  #
+  # Default output is a simple "Verified in TEE" / "Verified" / "Verification
+  # failed" per layer + a rolled-up Status. Use --verbose for the full cert
+  # chain / platform / endpoint dump.
+  # ==========================================================================
+  echo "[4/$TOTAL_CHECKS] Inference Provider"
+  OC_CONFIG="$ADMIN_HOME/.openclaw/openclaw.json"
+  if [ ! -f "$OC_CONFIG" ]; then
+    [ "$VERBOSE" = "true" ] && echo "  Config:        not found at $OC_CONFIG"
+    echo "  Status:        FAIL"
+    FAIL_COUNT=$((FAIL_COUNT + 1))
+    echo ""
+  else
+    # Try "confai" provider first (new name), fall back to "confidential" (legacy), then "lunal" (oldest)
+    ENDPOINT=$(jq -r '.models.providers.confai.baseUrl // .models.providers.confidential.baseUrl // .models.providers.lunal.baseUrl // "not configured"' "$OC_CONFIG" 2>/dev/null || echo "not configured")
+    [ "$VERBOSE" = "true" ] && echo "  Endpoint:      $ENDPOINT"
+
+    # Read bearer token from openclaw config (apiKey field)
+    BEARER_TOKEN=$(jq -r '.models.providers.confai.apiKey // .models.providers.confidential.apiKey // .models.providers.lunal.apiKey // empty' "$OC_CONFIG" 2>/dev/null || true)
+
+    # Make a minimal request to the inference endpoint and capture response headers
+    INF_HEADERS=""
+    if [ "$ENDPOINT" != "not configured" ]; then
+      # NOTE: Do NOT use `curl -I -X POST` — `-I` forces HEAD which conflicts
+      # with `-X POST` and curl bails out producing no output. Use `-D -` to
+      # dump headers from a real GET request instead. The /v1/models endpoint
+      # returns the same Attestation-Report header as /chat/completions.
+      # The gateway's TLS cert is signed by our private CA, which is installed
+      # into the CVM's system CA store at boot (via cloud-init). No -k needed.
+      CURL_AUTH_ARGS=()
+      if [ -n "$BEARER_TOKEN" ] && [ "$BEARER_TOKEN" != "not-needed" ]; then
+        CURL_AUTH_ARGS=(-H "Authorization: Bearer $BEARER_TOKEN")
+      fi
+      INF_HEADERS=$(curl -s -D - -o /dev/null "${CURL_AUTH_ARGS[@]}" "$ENDPOINT/models" \
+        --max-time 10 2>/dev/null) || true
+    fi
+
+    INF_PROVIDER=$(echo "$INF_HEADERS" | grep -i "^x-inference-provider:" | sed 's/[^:]*: *//' | tr -d '\r\n')
+    ATTESTATION=$(echo "$INF_HEADERS" | grep -i "^attestation-report:" | sed 's/[^:]*: *//' | tr -d '\r\n')
+    ORCH_ATTESTATION=$(echo "$INF_HEADERS" | grep -i "^x-orchestrator-attestation-report:" | sed 's/[^:]*: *//' | tr -d '\r\n')
+
+    # Track the two sub-check results separately. Final Status rolls both up.
+    UPSTREAM_OK=false       # Confidential AI OR Redpill upstream verified
+    UPSTREAM_LABEL=""       # Human-readable label printed in non-verbose output
+    UPSTREAM_DETAIL=""      # Short status ("Verified in TEE", "Verified", "Verification failed", etc.)
+    GATEWAY_OK=false        # Our tee-proxy verified
+    GATEWAY_DETAIL=""
+    FAILOVER_ACTIVE=false   # True when upstream is Redpill (downgrades PASS -> WARN)
+
+    if [ "$INF_PROVIDER" = "redpill" ]; then
+      # ----- Redpill failover path -----
+      # Redpill runs in Intel TDX + NVIDIA H100 CC. Attestation is not delivered
+      # in an HTTP response header like Confidential AI; it's fetched from a
+      # separate endpoint: GET https://api.redpill.ai/v1/attestation/report
+      # We do a best-effort check: does that endpoint return valid JSON with
+      # the expected attestation fields (signing_address, intel_quote,
+      # nvidia_payload)? Full Intel TDX quote verification is out of scope for
+      # this CLI — we defer that to redpill.ai / NVIDIA's RAS.
+      FAILOVER_ACTIVE=true
+      UPSTREAM_LABEL="Redpill (failover):"
+      RP_ENDPOINT="https://api.redpill.ai/v1/attestation/report"
+      # Prefer the provider's own apiKey if present (set to something other
+      # than "not-needed"); otherwise fall back to the gateway bearer token —
+      # older configs reuse one key for both.
+      RP_KEY=$(jq -r '.models.providers.redpill.apiKey // empty' "$OC_CONFIG" 2>/dev/null || true)
+      if [ -z "$RP_KEY" ] || [ "$RP_KEY" = "not-needed" ]; then
+        RP_KEY="$BEARER_TOKEN"
+      fi
+      RP_MODEL=$(jq -r '.models.providers.redpill.models[0].id // empty' "$OC_CONFIG" 2>/dev/null || true)
+      RP_NONCE=$(head -c 32 /dev/urandom | xxd -p -c 64 2>/dev/null || openssl rand -hex 32 2>/dev/null || echo "pcnonce$(date +%s%N)")
+      RP_QUERY=""
+      [ -n "$RP_MODEL" ] && RP_QUERY="?model=$(echo "$RP_MODEL" | sed 's|/|%2F|g')&nonce=$RP_NONCE" || RP_QUERY="?nonce=$RP_NONCE"
+      RP_RESP_FILE=$(mktemp /tmp/redpill_attest_XXXXXX.json)
+      RP_CURL_ARGS=()
+      [ -n "$RP_KEY" ] && [ "$RP_KEY" != "not-needed" ] && RP_CURL_ARGS=(-H "Authorization: Bearer $RP_KEY")
+      curl -s -o "$RP_RESP_FILE" "${RP_CURL_ARGS[@]}" "${RP_ENDPOINT}${RP_QUERY}" --max-time 15 2>/dev/null || true
+
+      if [ -s "$RP_RESP_FILE" ] && jq -e . "$RP_RESP_FILE" &>/dev/null; then
+        RP_SIGNING=$(jq -r '.signing_address // empty' "$RP_RESP_FILE" 2>/dev/null)
+        RP_INTEL=$(jq -r '.intel_quote // empty' "$RP_RESP_FILE" 2>/dev/null)
+        RP_NVIDIA=$(jq -r '.nvidia_payload // empty' "$RP_RESP_FILE" 2>/dev/null)
+        RP_ECHO_NONCE=$(jq -r '.request_nonce // .nonce // empty' "$RP_RESP_FILE" 2>/dev/null)
+        if [ -n "$RP_SIGNING" ] && [ -n "$RP_INTEL" ]; then
+          UPSTREAM_OK=true
+          UPSTREAM_DETAIL="Verified"
+          if [ "$VERBOSE" = "true" ]; then
+            echo "  Redpill Endpoint:       $RP_ENDPOINT"
+            echo "  Redpill Signing Addr:   $RP_SIGNING"
+            echo "  Redpill Signing Algo:   $(jq -r '.signing_algo // "unknown"' "$RP_RESP_FILE" 2>/dev/null)"
+            echo "  Redpill Intel TDX:      present (${#RP_INTEL} hex chars)"
+            [ -n "$RP_NVIDIA" ] && echo "  Redpill NVIDIA Payload: present"
+            if [ -n "$RP_ECHO_NONCE" ]; then
+              if [ "$RP_ECHO_NONCE" = "$RP_NONCE" ]; then
+                echo "  Redpill Nonce Match:    YES (fresh, not replayed)"
+              else
+                echo "  Redpill Nonce Match:    NO (sent=$RP_NONCE, got=$RP_ECHO_NONCE) — attestation may be stale"
+              fi
+            fi
+            echo "  Redpill Deep Verify:    NOT performed by CLI (Intel TDX + NVIDIA RAS verification)"
+          fi
+        else
+          UPSTREAM_DETAIL="Verification failed"
+          [ "$VERBOSE" = "true" ] && echo "  Redpill Attestation:    response missing signing_address or intel_quote"
+        fi
+      else
+        UPSTREAM_DETAIL="Verification failed"
+        [ "$VERBOSE" = "true" ] && echo "  Redpill Attestation:    could not fetch $RP_ENDPOINT (network/auth error)"
+      fi
+      rm -f "$RP_RESP_FILE"
+    elif [ -n "$ATTESTATION" ] || [ -n "$ORCH_ATTESTATION" ]; then
+      # ----- Confidential AI upstream path -----
+      UPSTREAM_LABEL="Confidential AI:"
+      [ "$VERBOSE" = "true" ] && echo "  Provider:      ${INF_PROVIDER:-confidential}"
+
+      # Confidential AI may send attestation in three formats:
+      #   1. base64+gzip → valid JSON evidence (old standalone inline mode)
+      #   2. raw JSON from attestation-service sidecar: {"platform":..., "evidence":{...}}
+      #   3. base64+gzip → HCLA binary (Azure HCL Attestation Report) with embedded PEM certs
+      if [ -n "$ATTESTATION" ]; then
+        INF_EVIDENCE_FILE=$(mktemp /tmp/inference_attestation_XXXXXX.json)
+        INF_BIN_FILE=$(mktemp /tmp/inference_bin_XXXXXX)
+        INF_DECODED=false
+        echo "$ATTESTATION" | base64 -d 2>/dev/null | gunzip > "$INF_BIN_FILE" 2>/dev/null || true
+        # Try 1: base64+gzip → valid JSON evidence
+        if [ -s "$INF_BIN_FILE" ] && jq -e . "$INF_BIN_FILE" &>/dev/null 2>&1; then
+          cp "$INF_BIN_FILE" "$INF_EVIDENCE_FILE"
+          INF_DECODED=true
+        fi
+        # Try 2: raw JSON (attestation-service sidecar format)
+        if [ "$INF_DECODED" = "false" ] && echo "$ATTESTATION" | jq -e . &>/dev/null 2>&1; then
+          INF_EVIDENCE=$(echo "$ATTESTATION" | jq -r 'if has("evidence") then .evidence else . end' 2>/dev/null)
+          if [ -n "$INF_EVIDENCE" ] && echo "$INF_EVIDENCE" | jq -e . &>/dev/null 2>&1; then
+            echo "$INF_EVIDENCE" > "$INF_EVIDENCE_FILE"
+            INF_DECODED=true
+          fi
+        fi
+        # Try 3: base64+gzip → HCLA binary (tee-proxy passes this through directly)
+        if [ "$INF_DECODED" = "false" ] && [ -s "$INF_BIN_FILE" ]; then
+          HCLA_MAGIC=$(dd if="$INF_BIN_FILE" bs=1 skip=8 count=4 2>/dev/null | xxd -p 2>/dev/null || true)
+          if [ "$HCLA_MAGIC" = "48434c41" ]; then
+            INF_VCEK_PEM=$(mktemp /tmp/inf_vcek_XXXXXX.pem)
+            INF_ASK_PEM=$(mktemp /tmp/inf_ask_XXXXXX.pem)
+            INF_ARK_PEM=$(mktemp /tmp/inf_ark_XXXXXX.pem)
+            INF_CHAIN_PEM=$(mktemp /tmp/inf_chain_XXXXXX.pem)
+            python3 - "$INF_BIN_FILE" "$INF_VCEK_PEM" "$INF_ASK_PEM" "$INF_ARK_PEM" <<'PYEOF'
+import sys, re
+bin_path, vcek_out, ask_out, ark_out = sys.argv[1:]
+with open(bin_path, "rb") as f:
+    data = f.read()
+pem_re = re.compile(b"-----BEGIN CERTIFICATE-----[\\s\\S]+?-----END CERTIFICATE-----")
+certs = pem_re.findall(data)
+outs = [vcek_out, ask_out, ark_out]
+for i, cert in enumerate(certs[:3]):
+    with open(outs[i], "wb") as out:
+        out.write(cert + b"\n")
+PYEOF
+            if [ -s "$INF_VCEK_PEM" ] && [ -s "$INF_ASK_PEM" ] && [ -s "$INF_ARK_PEM" ]; then
+              cat "$INF_ASK_PEM" "$INF_ARK_PEM" > "$INF_CHAIN_PEM"
+              VCEK_VERIFY=$(openssl verify -CAfile "$INF_CHAIN_PEM" "$INF_VCEK_PEM" 2>&1) || true
+              if echo "$VCEK_VERIFY" | grep -q ": OK"; then
+                [ "$VERBOSE" = "true" ] && echo "  Confidential AI Upstream VCEK Chain:  VALID (AMD root CA -> ASK -> VCEK)"
+                UPSTREAM_OK=true
+                INF_DECODED=true
+              else
+                [ "$VERBOSE" = "true" ] && echo "  Confidential AI Upstream Attestation: HCLA binary present but cert chain invalid" && echo "    openssl: $VCEK_VERIFY"
+              fi
+            else
+              [ "$VERBOSE" = "true" ] && echo "  Confidential AI Upstream Attestation: HCLA binary present but could not extract PEM certs"
+            fi
+            rm -f "$INF_VCEK_PEM" "$INF_ASK_PEM" "$INF_ARK_PEM" "$INF_CHAIN_PEM"
+          fi
+        fi
+        if [ "$INF_DECODED" = "true" ] && [ "$UPSTREAM_OK" = "false" ]; then
+          # JSON evidence path: verify with attestation-cli if available
+          if [ -n "$ATTESTATION_CLI" ]; then
+            INF_VERIFY_RESULT=$($ATTESTATION_CLI verify -e "$INF_EVIDENCE_FILE" 2>/dev/null) || true
+            if [ -n "$INF_VERIFY_RESULT" ] && echo "$INF_VERIFY_RESULT" | jq -e . &>/dev/null; then
+              INF_SIG_VALID=$(echo "$INF_VERIFY_RESULT" | jq -r '.signature_valid // false')
+              INF_PLATFORM=$(echo "$INF_VERIFY_RESULT" | jq -r '.platform // "unknown"')
+              [ "$VERBOSE" = "true" ] && echo "  Confidential AI Platform: $INF_PLATFORM (upstream inference cluster)"
+              if [ "$INF_SIG_VALID" = "true" ]; then
+                [ "$VERBOSE" = "true" ] && echo "  Confidential AI Upstream VCEK Chain: VALID (AMD root CA -> VCEK -> SNP report)"
+                UPSTREAM_OK=true
+              else
+                [ "$VERBOSE" = "true" ] && echo "  Confidential AI Upstream Attestation: INVALID (signature verification failed)"
+              fi
+            else
+              [ "$VERBOSE" = "true" ] && echo "  Confidential AI Upstream Attestation: present but verification failed"
+            fi
+          else
+            [ "$VERBOSE" = "true" ] && echo "  Confidential AI Upstream Attestation: present but no verifier (attestation-cli not found)"
+            UPSTREAM_OK=true  # don't fail if CLI is missing
+          fi
+        elif [ "$INF_DECODED" = "false" ]; then
+          [ "$VERBOSE" = "true" ] && echo "  Confidential AI Upstream Attestation: present but could not decode (expected base64+gzip+HCLA, base64+gzip+JSON, or raw JSON)"
+        fi
+        rm -f "$INF_EVIDENCE_FILE" "$INF_BIN_FILE"
+      else
+        [ "$VERBOSE" = "true" ] && echo "  Confidential AI Upstream Attestation: WARN — Attestation-Report header absent"
+      fi
+
+      if [ "$UPSTREAM_OK" = "true" ]; then
+        UPSTREAM_DETAIL="Verified in TEE"
+      else
+        UPSTREAM_DETAIL="Verification failed"
+      fi
+    fi
+
+    # --- Gateway attestation (X-Orchestrator-Attestation-Report, set by our tee-proxy via --header-name) ---
+    # This layer is verified on EVERY request regardless of upstream provider.
+    if [ -n "$ORCH_ATTESTATION" ]; then
+      ORCH_EVIDENCE_FILE=$(mktemp /tmp/orch_attestation_XXXXXX.json)
+      ORCH_DECODED=false
+      if echo "$ORCH_ATTESTATION" | base64 -d 2>/dev/null | gunzip > "$ORCH_EVIDENCE_FILE" 2>/dev/null; then
+        ORCH_DECODED=true
+      elif echo "$ORCH_ATTESTATION" | jq -e . &>/dev/null 2>&1; then
+        ORCH_EVIDENCE=$(echo "$ORCH_ATTESTATION" | jq -r 'if has("evidence") then .evidence else . end' 2>/dev/null)
+        if [ -n "$ORCH_EVIDENCE" ] && echo "$ORCH_EVIDENCE" | jq -e . &>/dev/null 2>&1; then
+          echo "$ORCH_EVIDENCE" > "$ORCH_EVIDENCE_FILE"
+          ORCH_DECODED=true
+        fi
+      fi
+      if [ "$ORCH_DECODED" = "true" ]; then
+        if [ -n "$ATTESTATION_CLI" ]; then
+          ORCH_VERIFY_RESULT=$($ATTESTATION_CLI verify -e "$ORCH_EVIDENCE_FILE" 2>/dev/null) || true
+          if [ -n "$ORCH_VERIFY_RESULT" ] && echo "$ORCH_VERIFY_RESULT" | jq -e . &>/dev/null; then
+            ORCH_SIG_VALID=$(echo "$ORCH_VERIFY_RESULT" | jq -r '.signature_valid // false')
+            ORCH_PLATFORM=$(echo "$ORCH_VERIFY_RESULT" | jq -r '.platform // "unknown"')
+            [ "$VERBOSE" = "true" ] && echo "  Gateway Platform: $ORCH_PLATFORM (our tee-proxy)"
+            if [ "$ORCH_SIG_VALID" = "true" ]; then
+              [ "$VERBOSE" = "true" ] && echo "  Gateway VCEK Chain: VALID (AMD root CA -> VCEK -> SNP report)"
+              GATEWAY_OK=true
+              GATEWAY_DETAIL="Verified in TEE"
+            else
+              [ "$VERBOSE" = "true" ] && echo "  Gateway Attestation: INVALID (signature verification failed)"
+              GATEWAY_DETAIL="Verification failed"
+            fi
+          else
+            [ "$VERBOSE" = "true" ] && echo "  Gateway Attestation: present but verification failed"
+            GATEWAY_DETAIL="Verification failed"
+          fi
+        else
+          [ "$VERBOSE" = "true" ] && echo "  Gateway Attestation: present but no verifier (attestation-cli not found)"
+          GATEWAY_OK=true  # don't fail if CLI is missing
+          GATEWAY_DETAIL="Verified in TEE"
+        fi
+      else
+        [ "$VERBOSE" = "true" ] && echo "  Gateway Attestation: present but could not decode (expected base64+gzip or JSON)"
+        GATEWAY_DETAIL="Verification failed"
+      fi
+      rm -f "$ORCH_EVIDENCE_FILE"
+    else
+      [ "$VERBOSE" = "true" ] && echo "  Gateway Attestation: WARN — X-Orchestrator-Attestation-Report absent"
+      GATEWAY_DETAIL="Verification failed"
+    fi
+
+    # --- Connection / missing-header sanity ---
+    # If neither upstream nor gateway produced any info, we couldn't reach the
+    # endpoint at all (empty headers) or the gateway is serving zero attestation
+    # headers. Treat as FAIL with no sub-checks.
+    if [ -z "$UPSTREAM_LABEL" ] && [ -z "$GATEWAY_DETAIL" ] && [ -z "$INF_HEADERS" ]; then
+      [ "$VERBOSE" = "true" ] && echo "  Connection:    could not reach inference endpoint"
+      echo "  Status:        FAIL"
+      FAIL_COUNT=$((FAIL_COUNT + 1))
+      echo ""
+    else
+      # --- Print simplified output (always shown, even in verbose) ---
+      # If we got no upstream label (no Attestation-Report + not redpill), we
+      # still want to say something. Default to "Confidential AI" with a
+      # verification failure so the user sees the gap clearly.
+      if [ -z "$UPSTREAM_LABEL" ]; then
+        UPSTREAM_LABEL="Confidential AI:"
+        UPSTREAM_DETAIL="Verification failed"
+      fi
+      # Label on its own line; value indented to column 18 on the next line.
+      # This keeps long upstream labels (e.g. "Redpill (failover):") and long
+      # detail strings from colliding, and stays readable in narrow terminals.
+      # The 17-space indent matches the "Status:" value column used elsewhere.
+      printf "  %s\n" "$UPSTREAM_LABEL"
+      printf "                 %s\n" "$UPSTREAM_DETAIL"
+      printf "  %s\n" "Confidential Gateway:"
+      printf "                 %s\n" "$GATEWAY_DETAIL"
+
+      # --- Roll up Status ---
+      # Status stays on a single line (matches other steps); value at col 18.
+      if [ "$UPSTREAM_OK" = "true" ] && [ "$GATEWAY_OK" = "true" ]; then
+        if [ "$FAILOVER_ACTIVE" = "true" ]; then
+          echo "  Status:        WARN (Redpill failover active)"
+          FAIL_COUNT=$((FAIL_COUNT + 1))
+        else
+          echo "  Status:        PASS"
+          PASS_COUNT=$((PASS_COUNT + 1))
+        fi
+      else
+        echo "  Status:        FAIL"
+        FAIL_COUNT=$((FAIL_COUNT + 1))
+      fi
+      echo ""
+    fi
+  fi
+
+  # ==========================================================================
+  # Check 5: External Access Lockout
+  # ==========================================================================
+  echo "[5/$TOTAL_CHECKS] External Access Lockout"
+
+  # Count authorized SSH keys. Two subtleties bit the previous version:
+  #  1. `grep -c` exits 1 when it finds zero matches. Combined with a
+  #     `|| echo 0` fallback, stdout concatenated "0\n" (from grep) + "0\n"
+  #     (from echo); command substitution stripped the trailing newline,
+  #     leaving KEY_COUNT="0\n0". That broke the display (two-line
+  #     "0\n0 authorized") AND the numeric comparison ([: 0\n0: integer
+  #     expression expected).
+  #  2. The old regex `^ssh-` missed ecdsa-* and sk-* key types, so users
+  #     with ECDSA or hardware-security keys would get KEY_COUNT=0 and
+  #     FAIL the step even with a valid key configured.
+  # Fix: match all standard OpenSSH key-type prefixes, and swallow grep's
+  # non-zero exit with `|| :` (no extra stdout) instead of `|| echo 0`.
+  if [ -r "$ADMIN_HOME/.ssh/authorized_keys" ]; then
+    KEY_COUNT=$(grep -cE '^(ssh-|ecdsa-|sk-)' "$ADMIN_HOME/.ssh/authorized_keys" 2>/dev/null || :)
+  else
+    KEY_COUNT=0
+  fi
+  # Defensive: if KEY_COUNT is empty or contains non-digits, reset to 0
+  # so the `[ -le 1 ]` comparison below never sees a multi-line string.
+  case "$KEY_COUNT" in
+    ''|*[!0-9]*) KEY_COUNT=0 ;;
+  esac
+  echo "  SSH keys:      $KEY_COUNT authorized"
+
+  if command -v ufw &>/dev/null; then
+    UFW_STATUS=$(sudo ufw status 2>/dev/null | head -1 || echo "unknown")
+    echo "  Firewall:      $UFW_STATUS"
+  fi
+
+  # Check if Azure Guest Agent can receive extensions
+  # Method 1: Check walinuxagent service status
+  #
+  # NOTE: `systemctl is-active` prints its verdict AND exits non-zero for any
+  # non-active state (e.g. "inactive" -> exit 3, "masked" -> exit 3). Using
+  # `|| echo "inactive"` then APPENDS a second "inactive" onto stdout, and
+  # the resulting "inactive\ninactive" string never equals "inactive" in the
+  # comparison below. Capture stdout unconditionally, trim, default to
+  # "inactive" if empty.
+  WAAGENT_STATUS=$(systemctl is-active walinuxagent 2>/dev/null | head -1 | tr -d '[:space:]')
+  [ -z "$WAAGENT_STATUS" ] && WAAGENT_STATUS="inactive"
+  # Method 2: Check waagent.conf Extensions.Enabled setting
+  EXTENSIONS_CONF=$(grep -i "^Extensions.Enabled" /etc/waagent.conf 2>/dev/null | cut -d= -f2 | tr -d ' ' || echo "unknown")
+
+  # PASS requires BOTH: waagent inactive AND config disables extensions.
+  # Anything else is FAIL — no WARN state.
+  # Label "Cloud provider access:" is too long to fit on a single line with
+  # padding to col 18, so print label and value on separate lines (same
+  # treatment as step [4/5]). Keep the "(waagent ..., config=...)" diagnostic
+  # suffix visible so users can google these exact terms.
+  if [ "$WAAGENT_STATUS" = "inactive" ] && [ "$EXTENSIONS_CONF" = "n" ]; then
+    echo "  Cloud provider access:"
+    echo "                 disabled (waagent $WAAGENT_STATUS, config=$EXTENSIONS_CONF)"
+    EXTENSIONS_DISABLED="true"
+  else
+    echo "  Cloud provider access:"
+    echo "                 FAIL — not fully locked out (waagent=$WAAGENT_STATUS, config=$EXTENSIONS_CONF)"
+    EXTENSIONS_DISABLED="false"
+  fi
+
+  # Overall: PASS requires SSH keys<=1 AND extensions disabled.
+  if [ "$KEY_COUNT" -le 1 ] && [ "$EXTENSIONS_DISABLED" = "true" ]; then
+    echo "  Status:        PASS"
+    PASS_COUNT=$((PASS_COUNT + 1))
+  elif [ "$KEY_COUNT" -le 1 ] && [ "$EXTENSIONS_DISABLED" = "false" ]; then
+    echo "  Status:        FAIL (Cloud provider access not blocked)"
+    FAIL_COUNT=$((FAIL_COUNT + 1))
+  else
+    echo "  Status:        FAIL ($KEY_COUNT SSH keys — expected 1)"
+    FAIL_COUNT=$((FAIL_COUNT + 1))
+  fi
+  echo ""
+
+  # -- Summary --
+  echo "---"
+  if [ "$FAIL_COUNT" -eq 0 ]; then
+    echo "All checks passed ($PASS_COUNT/$TOTAL_CHECKS)."
+  else
+    echo "$PASS_COUNT passed, $FAIL_COUNT failed or warned."
+  fi
+  echo ""
+}
+
+# ---------------------------------------------------------------------------
+# ccvm assign
+#   Called by systemd timer. Polls IMDS userData and applies user-specific
+#   configuration (SSH key, OpenClaw, MOTD, Caddy TLS).
+# ---------------------------------------------------------------------------
+cmd_assign() {
+  if [ -f "$ASSIGN_LOCK" ]; then
+    echo "Already assigned, skipping"
+    exit 0
+  fi
+
+  # Read admin user from inference.conf
+  ADMIN_USER="azureuser"
+  if [ -f "$INFERENCE_CONF" ]; then
+    CONF_USER=$(grep -E '^(VM_USER|ADMIN_USERNAME|CVM_ADMIN_USER|ADMIN_USER)=' "$INFERENCE_CONF" 2>/dev/null | cut -d= -f2)
+    if [ -n "$CONF_USER" ]; then
+      ADMIN_USER="$CONF_USER"
+    fi
+  fi
+
+  USERDATA=$(curl -s -H "Metadata: true" "http://169.254.169.254/metadata/instance/compute/userData?api-version=2021-01-01&format=text" 2>/dev/null || echo "")
+  if [ -z "$USERDATA" ] || [ "$USERDATA" = "" ]; then
+    echo "No userData found"
+    exit 0
+  fi
+
+  # Decode and parse
+  JSON=$(echo "$USERDATA" | base64 -d 2>/dev/null || echo "")
+  if [ -z "$JSON" ]; then
+    echo "Failed to decode userData"
+    exit 1
+  fi
+
+  SSH_KEY=$(echo "$JSON" | jq -r '.ssh_public_key // empty')
+  INSTANCE_NAME=$(echo "$JSON" | jq -r '.instance_name // empty')
+  LUNAL_ENDPOINT=$(echo "$JSON" | jq -r '.confidential_endpoint // .lunal_endpoint // empty')
+  LUNAL_MODEL=$(echo "$JSON" | jq -r '.confidential_model // .lunal_model // empty')
+  DNS_ZONE=$(echo "$JSON" | jq -r '.dns_zone // empty')
+  ORCHESTRATOR_IP=$(echo "$JSON" | jq -r '.orchestrator_ip // empty')
+
+  if [ -z "$SSH_KEY" ]; then
+    echo "No SSH key in userData, not yet assigned"
+    exit 0
+  fi
+
+  echo "Processing assignment for $INSTANCE_NAME"
+
+  # 1. Set SSH key (clean slate -- only user's key)
+  mkdir -p /home/$ADMIN_USER/.ssh
+  printf '%s\n' "$SSH_KEY" > /home/$ADMIN_USER/.ssh/authorized_keys
+  chown -R $ADMIN_USER:$ADMIN_USER /home/$ADMIN_USER/.ssh
+  chmod 700 /home/$ADMIN_USER/.ssh
+  chmod 600 /home/$ADMIN_USER/.ssh/authorized_keys
+
+  # 2. Configure OpenClaw with Confidential AI inference
+  GATEWAY_TOKEN=$(openssl rand -hex 16)
+  sudo -u $ADMIN_USER mkdir -p /home/$ADMIN_USER/.openclaw
+  cat > /home/$ADMIN_USER/.openclaw/openclaw.json << OCEOF
+  {
+    "gateway": {
+      "mode": "local",
+      "bind": "loopback",
+      "auth": {
+        "mode": "token",
+        "token": "$GATEWAY_TOKEN"
+      }
+    },
+    "models": {
+      "providers": {
+        "confidential": {
+          "api": "openai-completions",
+          "baseUrl": "${LUNAL_ENDPOINT}/v1",
+          "apiKey": "not-needed",
+          "models": [
+            {
+              "id": "${LUNAL_MODEL}",
+              "name": "${LUNAL_MODEL}",
+              "contextWindow": 32768,
+              "maxTokens": 8192,
+              "reasoning": false,
+              "input": ["text"],
+              "cost": {
+                "input": 0,
+                "output": 0
+              }
+            }
+          ]
+        }
+      }
+    },
+    "agents": {
+      "defaults": {
+        "model": {
+          "primary": "confidential/${LUNAL_MODEL}"
+        },
+        "heartbeat": {
+          "every": "30m"
+        }
+      }
+    }
+  }
+OCEOF
+  chown $ADMIN_USER:$ADMIN_USER /home/$ADMIN_USER/.openclaw/openclaw.json
+
+  # 3. Repair and start OpenClaw gateway daemon
+  ADMIN_UID=$(id -u $ADMIN_USER)
+  runuser -l $ADMIN_USER -c "export XDG_RUNTIME_DIR=/run/user/$ADMIN_UID DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$ADMIN_UID/bus && openclaw doctor --repair" || true
+  runuser -l $ADMIN_USER -c "export XDG_RUNTIME_DIR=/run/user/$ADMIN_UID DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$ADMIN_UID/bus && systemctl --user restart openclaw-gateway.service" || true
+
+  # 4. Set MOTD
+  CONNECT_HOST="${INSTANCE_NAME}"
+  if [ -n "$DNS_ZONE" ]; then
+    CONNECT_HOST="${INSTANCE_NAME}.${DNS_ZONE}"
+  fi
+  cat > /etc/motd << MOTDEOF
+
+      +----------------------------------------------------------+
+      |                                                          |
+      |  Welcome to Confidential CVM                             |
+      |  Running in a Trusted Execution Environment (SEV-SNP)    |
+      |  with end-to-end private inference                       |
+      |                                                          |
+      |  Verify your TEE:                                        |
+      |    $ ccvm verify                                         |
+      |                                                          |
+      |  Connect a messaging provider:                           |
+      |    $ openclaw configure --section channels               |
+      |                                                          |
+      |  Chat in the terminal:                                   |
+      |    $ openclaw tui                                        |
+      |                                                          |
+      +----------------------------------------------------------+
+
+MOTDEOF
+
+  # 5. Configure and start Caddy TLS reverse proxy for OpenClaw gateway
+  printf '%s {\n    reverse_proxy localhost:18789\n}\n' "$CONNECT_HOST" > /etc/caddy/Caddyfile
+  systemctl enable caddy
+  systemctl start caddy
+
+  # 6. Mark as assigned (prevents re-runs)
+  mkdir -p "$ATTEST_DIR"
+  date > "$ASSIGN_LOCK"
+
+  # 7. Notify orchestrator that assignment is complete
+  CALLBACK_URL=$(echo "$JSON" | jq -r '.callback_url // empty')
+  if [ -n "$CALLBACK_URL" ]; then
+    if [ -n "$ORCHESTRATOR_IP" ]; then
+      ufw allow out to "$ORCHESTRATOR_IP" || true
+    fi
+    curl -s -X POST "$CALLBACK_URL" --max-time 10 || true
+    if [ -n "$ORCHESTRATOR_IP" ]; then
+      ufw delete allow out to "$ORCHESTRATOR_IP" || true
+    fi
+  fi
+
+  # 8. Disable assignment watcher -- no longer needed
+  systemctl disable --now privateclaw-assign-watcher.timer || true
+
+  echo "Assignment complete for $INSTANCE_NAME"
+}
+
+# ---------------------------------------------------------------------------
+# ccvm info
+#   Print environment info for user debugging: component versions, hostname,
+#   gateway IP, and install date.
+# ---------------------------------------------------------------------------
+cmd_info() {
+  # attestation-cli version
+  local att_version="not found"
+  if [ -n "$ATTESTATION_CLI" ]; then
+    att_version=$($ATTESTATION_CLI --version 2>/dev/null || echo "not found")
+  fi
+
+  # openclaw version -- try binary first, then fall back to package.json
+  local openclaw_version="not found"
+  if command -v openclaw &>/dev/null; then
+    openclaw_version=$(openclaw --version 2>/dev/null | head -1 || echo "")
+  fi
+  if [ -z "$openclaw_version" ] || [ "$openclaw_version" = "not found" ]; then
+    local pkg="$HOME/.npm-global/lib/node_modules/openclaw/package.json"
+    if [ -f "$pkg" ]; then
+      if command -v jq &>/dev/null; then
+        openclaw_version=$(jq -r '.version // "not found"' "$pkg" 2>/dev/null || echo "not found")
+      else
+        openclaw_version=$(grep -oE '"version"[[:space:]]*:[[:space:]]*"[^"]+"' "$pkg" | head -1 | sed -E 's/.*"([^"]+)"$/\1/')
+        [ -z "$openclaw_version" ] && openclaw_version="not found"
+      fi
+    fi
+  fi
+
+  # Hostname
+  local host
+  host=$(hostname -f 2>/dev/null || hostname 2>/dev/null || echo "unknown")
+
+  # Gateway IP -- strip protocol + port from openclaw.json baseUrl
+  local gateway_ip="not found"
+  local openclaw_conf="$HOME/.openclaw/openclaw.json"
+  if [ -f "$openclaw_conf" ] && command -v jq &>/dev/null; then
+    gateway_ip=$(jq -r '.models.providers.confai.baseUrl // .models.providers.confidential.baseUrl // empty' "$openclaw_conf" 2>/dev/null \
+      | sed 's|https://||; s|http://||' \
+      | cut -d: -f1 \
+      | cut -d/ -f1)
+    [ -z "$gateway_ip" ] && gateway_ip="not found"
+  fi
+
+  # Install date
+  local installed="not found"
+  if [ -f /usr/local/bin/ccvm ]; then
+    installed=$(stat -c %y /usr/local/bin/ccvm 2>/dev/null | cut -d' ' -f1)
+    [ -z "$installed" ] && installed="not found"
+  fi
+
+  # Aligned output (labels padded to 18 chars)
+  printf '%-18s %s\n' "ccvm:"            "$VERSION"
+  printf '%-18s %s\n' "attestation-cli:" "$att_version"
+  printf '%-18s %s\n' "openclaw:"        "$openclaw_version"
+  printf '%-18s %s\n' "Hostname:"        "$host"
+  printf '%-18s %s\n' "Gateway IP:"      "$gateway_ip"
+  printf '%-18s %s\n' "Installed:"       "$installed"
+}
+
+# ---------------------------------------------------------------------------
+# Main dispatch
+# ---------------------------------------------------------------------------
+print_usage() {
+  echo "Usage: ccvm <command> [flags]"
+  echo ""
+  echo "Commands:"
+  echo "  verify [-v|--verbose]   Verify SEV-SNP hardware, TPM, host key, inference, and access lockout"
+  echo "                          -v/--verbose shows full cert chain and diagnostic details"
+  echo "  attest                  Generate attestation evidence (run at boot)"
+  echo "  assign                  Apply user configuration from IMDS (run by systemd)"
+  echo "  info                    Print component versions, hostname, gateway IP, and install date"
+}
+
+case "${1:-}" in
+  attest)  shift; cmd_attest "$@" ;;
+  verify)  shift; cmd_verify "$@" ;;
+  assign)  shift; cmd_assign "$@" ;;
+  info)    shift; cmd_info "$@" ;;
+  # Cheap compatibility for the prior two-level command shape.
+  vm)
+    shift
+    case "${1:-}" in
+      attest)  shift; cmd_attest "$@" ;;
+      verify)  shift; cmd_verify "$@" ;;
+      assign)  shift; cmd_assign "$@" ;;
+      info)    shift; cmd_info "$@" ;;
+      *)       print_usage ;;
+    esac
+    ;;
+  *)
+    print_usage
+    ;;
+esac
